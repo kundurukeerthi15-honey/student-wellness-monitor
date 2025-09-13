@@ -1,0 +1,257 @@
+# wellness_monitor.py
+from flask import Flask, request, redirect, url_for, render_template_string, g
+import sqlite3
+from datetime import datetime
+import statistics
+
+DB = 'wellness.db'
+APP = Flask(__name__)
+APP.config['SECRET_KEY'] = 'replace-with-a-random-secret-for-production'
+
+# ---------- Database helpers ----------
+def get_db():
+    db = getattr(g, '_database', None)
+    if db is None:
+        db = g._database = sqlite3.connect(DB)
+        db.row_factory = sqlite3.Row
+    return db
+
+def init_db():
+    db = get_db()
+    cursor = db.cursor()
+    cursor.execute('''
+        CREATE TABLE IF NOT EXISTS responses (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            student_name TEXT,
+            timestamp TEXT,
+            sleep_hours REAL,
+            mood INTEGER,
+            stress INTEGER,
+            exercise_minutes INTEGER,
+            notes TEXT
+        )
+    ''')
+    db.commit()
+
+@APP.teardown_appcontext
+def close_connection(exception):
+    db = getattr(g, '_database', None)
+    if db is not None:
+        db.close()
+
+# ---------- Routes & logic ----------
+SURVEY_HTML = """
+<!doctype html>
+<html>
+<head>
+  <title>Student Wellness Survey</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <style>
+    body{font-family:Segoe UI,Roboto,Arial;margin:20px;max-width:720px}
+    input,textarea,select{width:100%;padding:8px;margin:6px 0}
+    label{font-weight:600}
+    .btn{background:#1976d2;color:#fff;padding:10px;border:none;border-radius:6px}
+    .note{font-size:0.9rem;color:#555}
+  </style>
+</head>
+<body>
+  <h1>Student Wellness Survey</h1>
+  <form method="POST" action="{{ url_for('submit') }}">
+    <label for="student_name">Name (optional)</label>
+    <input id="student_name" name="student_name" placeholder="Your name or leave blank for anonymous">
+
+    <label for="sleep_hours">Sleep (hours last 24h)</label>
+    <input id="sleep_hours" name="sleep_hours" type="number" min="0" max="24" step="0.5" required>
+
+    <label for="mood">Mood (1 = very low, 5 = very high)</label>
+    <select id="mood" name="mood" required>
+      <option value="5">5 — Very good</option>
+      <option value="4">4 — Good</option>
+      <option value="3">3 — Neutral</option>
+      <option value="2">2 — Low</option>
+      <option value="1">1 — Very low</option>
+    </select>
+
+    <label for="stress">Stress level (0 = none, 10 = extreme)</label>
+    <input id="stress" name="stress" type="number" min="0" max="10" step="1" required>
+
+    <label for="exercise_minutes">Exercise minutes (last 24h)</label>
+    <input id="exercise_minutes" name="exercise_minutes" type="number" min="0" max="1440" step="1" required>
+
+    <label for="notes">Notes (optional)</label>
+    <textarea id="notes" name="notes" rows="4" placeholder="Anything you want to share..."></textarea>
+
+    <button class="btn" type="submit">Submit</button>
+  </form>
+
+  <p class="note">This is a demo app. Data is stored locally in a SQLite file.</p>
+  <hr>
+  <p><a href="{{ url_for('dashboard') }}">View Dashboard</a></p>
+</body>
+</html>
+"""
+
+DASHBOARD_HTML = """
+<!doctype html>
+<html>
+<head>
+  <title>Wellness Dashboard</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+  <style>
+    body{font-family:Segoe UI,Roboto,Arial;margin:20px;max-width:1000px}
+    .card{border-radius:8px;padding:16px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,0.08)}
+    table{width:100%;border-collapse:collapse}
+    th,td{padding:8px;border-bottom:1px solid #eee;text-align:left}
+    .alert{color:#b71c1c;font-weight:700}
+    .small{font-size:0.9rem;color:#555}
+  </style>
+</head>
+<body>
+  <h1>Wellness Dashboard</h1>
+
+  <div class="card">
+    <h3>Overview</h3>
+    <p class="small">Total responses: <strong>{{ total }}</strong> • Average sleep: <strong>{{ avg_sleep }}</strong> hrs • Avg stress: <strong>{{ avg_stress }}</strong> • Avg mood: <strong>{{ avg_mood }}</strong></p>
+  </div>
+
+  <div class="card">
+    <h3>Trends (last {{ len(timestamps) }} responses)</h3>
+    <canvas id="trendChart" height="120"></canvas>
+    <script>
+      const ctx = document.getElementById('trendChart');
+      new Chart(ctx, {
+        type: 'line',
+        data: {
+          labels: {{ timestamps|tojson }},
+          datasets: [
+            { label: 'Sleep (hrs)', data: {{ sleep_list|tojson }}, tension:0.2, fill:false },
+            { label: 'Stress (0-10)', data: {{ stress_list|tojson }}, tension:0.2, fill:false },
+            { label: 'Mood (1-5)', data: {{ mood_list|tojson }}, tension:0.2, fill:false }
+          ]
+        },
+        options: {
+          scales: { x: { display: true, title: { display: false } } }
+        }
+      });
+    </script>
+  </div>
+
+  <div class="card">
+    <h3>At-risk students (stress ≥ {{ alert_threshold }})</h3>
+    {% if alerts %}
+      <table>
+        <thead><tr><th>Name</th><th>Time</th><th>Stress</th><th>Notes</th></tr></thead>
+        <tbody>
+        {% for r in alerts %}
+          <tr>
+            <td>{{ r['student_name'] or 'Anonymous' }}</td>
+            <td>{{ r['timestamp'] }}</td>
+            <td class="alert">{{ r['stress'] }}</td>
+            <td>{{ r['notes'] }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    {% else %}
+      <p class="small">No responses meet the at-risk threshold.</p>
+    {% endif %}
+  </div>
+
+  <div class="card">
+    <h3>Recent responses</h3>
+    <table>
+      <thead><tr><th>Time</th><th>Name</th><th>Sleep</th><th>Stress</th><th>Mood</th><th>Exercise</th></tr></thead>
+      <tbody>
+      {% for r in recent %}
+        <tr>
+          <td>{{ r['timestamp'] }}</td>
+          <td>{{ r['student_name'] or 'Anonymous' }}</td>
+          <td>{{ r['sleep_hours'] }}</td>
+          <td>{{ r['stress'] }}</td>
+          <td>{{ r['mood'] }}</td>
+          <td>{{ r['exercise_minutes'] }}</td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <p><a href="{{ url_for('survey') }}">Submit new response</a></p>
+</body>
+</html>
+"""
+
+@APP.before_request
+def before_request():
+    init_db()
+
+@APP.route('/', methods=['GET'])
+def survey():
+    return render_template_string(SURVEY_HTML)
+
+@APP.route('/submit', methods=['POST'])
+def submit():
+    sname = request.form.get('student_name', '').strip()
+    try:
+        sleep_hours = float(request.form.get('sleep_hours', 0))
+    except ValueError:
+        sleep_hours = 0.0
+    mood = int(request.form.get('mood', 3))
+    stress = int(request.form.get('stress', 0))
+    exercise_minutes = int(request.form.get('exercise_minutes', 0))
+    notes = request.form.get('notes', '').strip()
+    timestamp = datetime.utcnow().isoformat(timespec='seconds') + 'Z'
+
+    db = get_db()
+    db.execute('''
+        INSERT INTO responses (student_name, timestamp, sleep_hours, mood, stress, exercise_minutes, notes)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+    ''', (sname, timestamp, sleep_hours, mood, stress, exercise_minutes, notes))
+    db.commit()
+
+    # Simple "alerting" example: log to server console if stress >= threshold
+    ALERT_THRESHOLD = 8
+    if stress >= ALERT_THRESHOLD:
+        print(f"[ALERT] High stress from {sname or 'Anonymous'} at {timestamp}: stress={stress}; notes={notes}")
+
+    return redirect(url_for('dashboard'))
+
+@APP.route('/dashboard', methods=['GET'])
+def dashboard():
+    db = get_db()
+    rows = db.execute('SELECT * FROM responses ORDER BY id DESC LIMIT 200').fetchall()
+    total = db.execute('SELECT COUNT(*) FROM responses').fetchone()[0]
+    # Build lists for charts (most recent first; reverse to chronological)
+    rows_rev = list(reversed(rows))
+    timestamps = [r['timestamp'][0:19].replace('T', ' ') for r in rows_rev]
+    sleep_list = [r['sleep_hours'] for r in rows_rev]
+    stress_list = [r['stress'] for r in rows_rev]
+    mood_list = [r['mood'] for r in rows_rev]
+
+    # Basic aggregates (safe defaults)
+    avg_sleep = round(statistics.mean(sleep_list), 2) if sleep_list else 0
+    avg_stress = round(statistics.mean(stress_list), 2) if stress_list else 0
+    avg_mood = round(statistics.mean(mood_list), 2) if mood_list else 0
+
+    ALERT_THRESHOLD = 8
+    alerts = db.execute('SELECT * FROM responses WHERE stress >= ? ORDER BY id DESC LIMIT 50', (ALERT_THRESHOLD,)).fetchall()
+    recent = rows  # already ordered desc
+
+    return render_template_string(DASHBOARD_HTML,
+                                  total=total,
+                                  avg_sleep=avg_sleep,
+                                  avg_stress=avg_stress,
+                                  avg_mood=avg_mood,
+                                  timestamps=timestamps,
+                                  sleep_list=sleep_list,
+                                  stress_list=stress_list,
+                                  mood_list=mood_list,
+                                  alerts=alerts,
+                                  recent=recent,
+                                  alert_threshold=ALERT_THRESHOLD)
+
+# ---------- Entry ----------
+if __name__ == '__main__':
+    print("Starting Student Wellness Monitor (Flask). Open http://127.0.0.1:5000")
+    APP.run(debug=True)
